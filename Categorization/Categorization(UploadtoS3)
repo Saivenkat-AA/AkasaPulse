@@ -1,0 +1,284 @@
+import pandas as pd
+import numpy as np
+import logging
+import boto3
+import re
+import json
+from tqdm import tqdm
+from botocore.exceptions import ClientError
+import uuid
+import time
+from datetime import datetime
+import os
+import tempfile
+
+logger = logging.getLogger(__name__)    
+logging.basicConfig(level=logging.INFO)
+
+df = pd.read_excel("C:/Users/mallampati.saivenkat/Downloads/feedback_batch_processing.xlsx")
+
+def create_local_batch_input_file(df, feedback_column, respondent_id_column, output_dir="./batch_temp"):
+    """
+    Create batch input file locally with Respondent_ID included
+    
+    Args:
+        df (pd.DataFrame): DataFrame containing feedback data
+        feedback_column (str): Column name containing feedback text
+        respondent_id_column (str): Column name containing respondent ID
+        output_dir (str): Directory to save files
+    
+    Returns:
+        str: Path to the created input file
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate unique filename
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    job_id = str(uuid.uuid4())[:8]
+    input_file = os.path.join(output_dir, f"feedback-input-{timestamp}-{job_id}.jsonl")
+    
+    
+    # Define your category mappings (you'll need to define these)
+    sentiment_id = {'Positive': 1, 'Neutral': 0, 'Negative': -1}
+    
+    category_keywords = {
+        'Compensation': ['Salary', 'Allowance'], 
+        'Employee Policies & Benefits': ['ELT', 'Insurance', 'Transport', 'Night shift Allowance', 'Leaves', 'Medi Claims', 'HR Polices'], 
+        'Career & Growth': ['Promotion', 'Progression', 'Internal Job Post', 'Transfer'], 
+        'Reward and Recognition': ['Getting recognised for work', 'Appreciation at work place'], 
+        'Learning & Development': ['Learning needs', 'Training needs'], 
+        'Work Place Amenities': ['Drinking Water', 'Space', 'Washroom'], 
+        'Work Environment & Culture': ['Respect at work place', 'Fairness at work place', 'Transparency', 'Inclusivity', 'Positivity at work', 'Empowerment'], 
+        'Operational Effectiveness': ['Rostering', 'Scheduling', 'Resource Shortage', 'Lack of Information', 'Communication Gaps'], 
+        'Leadership': ['HOD', 'EXCOM', 'Vison of organisation', 'Org decisions'], 
+        'Line Manager': ['Immediate Line Manager'], 
+        'Team': ['Immediate team members'], 
+        'Cross functional Collaboration': ['Other departments and teams'], 
+        'Pride and Brand association': ['General Positive or Negative feedback about Akasa Air']
+    }
+    
+    category_examples = {
+        'Compensation': 'Salary should be revised.Kindly increase hours or salary.',
+        'Employee Policies & Benefits': 'Night allowances Two way cab felicity or transport allowance.',
+        'Career & Growth': 'Currently I am looking for growth in terms of designation. I have been working with Akasa from last 3.5 years and have managed different profiles in all these years. Grateful to Akasa for providing me with an opportunity to work on such diverse profiles but I am currently looking at taking a step ahead with promotion as well.',
+        'Reward and Recognition': 'More staff centric appreciation to be there,best employee of month ,best performers Tobe awarded',
+        'Learning & Development': 'Training should be expedited',
+        'Work Place Amenities': 'Just need some extra facilities for employees',
+        'Work Environment & Culture': 'To much politics & favoritism in the team.  Need to maintain transparency & fairness in the team.',
+        'Operational Effectiveness': 'No work life balance with long patterns and rostering changes',
+        'Leadership': 'I wanted to take a moment to express my appreciation for the outstanding leadership demonstrated by Ananya Narula (SR GM AALA) Ananya has consistently gone above and beyond to foster a positive work environment, motivate individuals, promote transparency, and lead by example. Her efforts have undoubtedly contributed to the overall success and morale of our team.',
+        'Line Manager': 'The duty manager send mails for things which I havenâ€™t done and I have to explain every time.',
+        'Team': 'Seniors should treat all subordinates with equal respect and fairness.',
+        'Cross functional Collaboration': 'Improved inter-departmental communication would enhance overall efficiency.Streamlining processes for approvals and addressing requirements could help reduce delays and prevent unnecessary issues with regulatory authorities.',
+        'Pride and Brand association': 'I feel extremely good to work with Akasa Air.'
+    }
+    
+    category_id = {
+        'Compensation': 1, 
+        'Employee Policies & Benefits': 2, 
+        'Career & Growth': 3, 
+        'Reward and Recognition': 4, 
+        'Learning & Development': 5, 
+        'Work Place Amenities': 6, 
+        'Work Environment & Culture': 7, 
+        'Operational Effectiveness': 8, 
+        'Leadership': 9, 
+        'Line Manager': 10, 
+        'Team': 11, 
+        'Cross functional Collaboration': 12, 
+        'Pride and Brand association': 13
+    }
+    
+    batch_requests = []
+    
+    for index, row in df.iterrows():
+        feedback_text = str(row[feedback_column])
+        respondent_id = str(row[respondent_id_column])  # Get the actual Respondent_ID
+        
+        # Create the prompt for each feedback with Respondent_ID included
+        user_message = f"""You are an expert text classifier specializing in employee feedback analysis. 
+Your task is to classify employee feedback into predefined categories using their assigned IDs, and determine the sentiment for each identified category.
+The sentiments which should only be used are : Positive, Neutral & Negative with respective sentiment IDs as {sentiment_id}.
+For each feedback, identify the relevant categories based on the provided keywords and from {category_keywords} and examples {category_examples}, 
+and assign the accurate category IDs from {category_id} and its appropriate sentiment id as present in {sentiment_id}.
+
+Classification Guidelines:
+1. Analyze the feedback to identify relevant categories based on the provided keywords and examples.
+2. Assign the corresponding category ID from {category_id} for each identified category.
+3. Determine the sentiment for each category and assign the appropriate sentiment ID from {sentiment_id} to that category.
+4. If any feedback does not match any category, assign 0 as the category ID and never it as empty.
+5. The feedback can belong to multiple categories and ensure to assign the correct category ID and sentiment ID for each.
+6. If the feedback doesn't match any category, assign sentiment based on the overall tone of the feedback.
+7. Only use Category IDs and Sentiment IDs from the provided mappings and do not create new ones in any case.
+8. If any feedback gives mixed sentiment for a category, choose the sentiment which is more dominant
+9. If the feedback is a generic feedback without any specific details, should be assigned 0 for category ID and sentiment ID based on the overall tone of the feedback.
+10. No duplicate category IDs should be present in the output.
+11. Explainations or additional text should not be present in the output. Only the dictionary with category IDs and sentiment IDs should be returned.
+12. Ensure the output will always in dict format with keys as category_id and values as its corresponding sentiment_id.
+13. If the feedback is suggestion based or improvement based, the sentiment should always be Neutral.
+
+Respondent_ID: {respondent_id}
+Feedback: {feedback_text}
+
+Output:
+Output should be in the following format:
+{{
+    "category_id_1": "sentiment_id_1",
+    "category_id_2": "sentiment_id_2",
+    ...
+}}
+
+"""
+        
+        # Create batch request item using Respondent_ID as recordId
+        batch_request = {
+            "recordId": respondent_id,  # Use actual Respondent_ID instead of index
+            "modelInput": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": user_message}]
+                    }
+                ],
+                "inferenceConfig": {
+                    "maxTokens": 100,
+                    "temperature": 0,
+                    "topP": 0.1
+                }
+            }
+        }
+        batch_requests.append(batch_request)
+    
+    # Write to JSONL file
+    with open(input_file, 'w', encoding='utf-8') as f:
+        for request in batch_requests:
+            f.write(json.dumps(request) + '\n')
+    
+    print(f"Batch input file created: {input_file}")
+    print(f"Total requests: {len(batch_requests)}")
+    return input_file
+
+def upload_to_s3_temp(file_path, s3_client, bucket_name):
+    """
+    Upload file to S3 temporarily for batch processing
+    
+    Args:
+        file_path (str): Local file path
+        s3_client: S3 client
+        bucket_name (str): S3 bucket name
+    
+    Returns:
+        str: S3 URI
+    """
+    filename = os.path.basename(file_path)
+    s3_key = f"temp-batch-inference/{filename}"
+    
+    try:
+        s3_client.upload_file(file_path, bucket_name, s3_key)
+        s3_uri = f"s3://{bucket_name}/{s3_key}"
+        print(f"File uploaded to: {s3_uri}")
+        return s3_uri
+    except ClientError as e:
+        print(f"Error uploading to S3: {e}")
+        return None
+
+def cleanup_temp_files(*file_paths):
+    """
+    Clean up temporary files
+    
+    Args:
+        *file_paths: Variable number of file paths to delete
+    """
+    for file_path in file_paths:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"Cleaned up: {file_path}")
+            except Exception as e:
+                print(f"Error cleaning up {file_path}: {e}")
+
+def process_feedback_batch_local(df, feedback_column, s3_bucket, role_arn, aws_credentials, cleanup_files=True): #1
+    """
+    Process feedback using batch inference with local file handling
+    
+    Args:
+        df (pd.DataFrame): DataFrame with feedback data
+        feedback_column (str): Column name containing feedback text
+        s3_bucket (str): S3 bucket for temporary files (still needed for batch processing)
+        role_arn (str): IAM role ARN for batch processing
+        aws_credentials (dict): AWS credentials dictionary
+        cleanup_files (bool): Whether to clean up temporary files
+    
+    Returns:
+        pd.DataFrame: DataFrame with categories and sentiments added
+    """
+    
+    # Initialize AWS clients
+    bedrock_client = boto3.client(
+        "bedrock",
+        aws_access_key_id=aws_credentials['aws_access_key_id'],
+        aws_secret_access_key=aws_credentials['aws_secret_access_key'],
+        aws_session_token=aws_credentials['aws_session_token'],
+        region_name=aws_credentials['region_name']
+    )
+    
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=aws_credentials['aws_access_key_id'],
+        aws_secret_access_key=aws_credentials['aws_secret_access_key'],
+        aws_session_token=aws_credentials['aws_session_token'],
+        region_name=aws_credentials['region_name']
+    )
+    
+    model_id = "apac.amazon.nova-pro-v1:0"
+    
+    # Generate unique identifiers
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    job_id = str(uuid.uuid4())[:8]
+    
+    local_input_file = None
+    local_output_file = None
+    
+    try:
+        # Step 1: Create local input file
+        print("Step 1: Creating local input file...")
+        local_input_file = create_local_batch_input_file(df,respondent_id_column='Respondent_ID', feedback_column = feedback_column)
+        
+        # Step 2: Upload to S3 temporarily
+        print("Step 2: Uploading to S3 temporarily...")
+        input_s3_uri = upload_to_s3_temp(local_input_file, s3_client, s3_bucket)
+        if not input_s3_uri:
+            return df
+    
+    finally:
+        # Cleanup temporary files
+        if cleanup_files:
+            cleanup_temp_files(local_input_file, local_output_file)
+
+# Simple usage function
+def process_feedbacks(df, feedback_column, s3_bucket, role_arn):
+    """
+    Simple function to process feedbacks with your existing credentials
+    
+    Args:
+        df (pd.DataFrame): DataFrame with feedback data
+        feedback_column (str): Column name containing feedback text
+        s3_bucket (str): S3 bucket name
+        role_arn (str): IAM role ARN
+    
+    Returns:
+        pd.DataFrame: DataFrame with results
+    """
+    aws_credentials = {
+        'aws_access_key_id': 'A',
+        'aws_secret_access_key': 'hM16Q',
+        'aws_session_token': 'IQoJ',
+        'region_name': 'ap-south-1'
+    }
+    
+    return process_feedback_batch_local(df, feedback_column, s3_bucket, role_arn, aws_credentials)
+
+result_df = process_feedbacks(df=df,feedback_column='Feedback',s3_bucket='akasa-bedrock',role_arn='arn:aws:iam::891377165721:role/Amazon-Bedrock-Batchinference-Role')
+
+
