@@ -1,0 +1,43 @@
+import pandas as pd
+import numpy as np
+import json
+import ast
+import re
+
+file_path = r"C:/Users/mallampati.saivenkat/Downloads/feedback-sentiment-analysis.jsonl.out"
+
+records = []
+errors = []
+
+
+with open(file_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        try:
+            entry = json.loads(line)
+            respondent_id = entry.get("recordId")
+            
+            # Correct path for Model_Output
+            model_output = (
+                entry.get("modelOutput", {})
+                     .get("output", {})
+                     .get("message", {})
+                     .get("content", [{}])[0]
+                     .get("text")
+            )
+            
+            if respondent_id is not None and model_output is not None:
+                records.append({"Respondent_ID": respondent_id, "Model_Output": model_output})
+            else:
+                errors.append({"Respondent_ID": respondent_id, "Model_Output": model_output})
+        
+        except Exception:
+            # Log unexpected errors
+            errors.append({"Respondent_ID": None, "Model_Output": None})
+
+
+
+extract_df = pd.DataFrame(records)
+error_df = pd.DataFrame(errors)
+
+extract_df.to_excel("Sentiment_Analysis_Output.xlsx", index=False)
+
