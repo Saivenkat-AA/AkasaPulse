@@ -1,0 +1,140 @@
+import pandas as pd
+import numpy as np
+import json
+import ast
+import re
+
+file_path = r"C:/Users/mallampati.saivenkat/Downloads/feedback-categorization.jsonl.out"
+
+records = []
+errors = []
+
+def safe_get_model_text(entry):
+    """
+    Safely extract the model output text from a variety of possible shapes.
+    Expected shape:
+      entry["modelOutput"]["output"]["message"]["content"][0]["text"]
+    But this function tolerates missing keys, None values, or different types.
+    """
+    mo = entry.get("modelOutput")
+    if mo is None:
+        return None
+
+    # If modelOutput is already a string
+    if isinstance(mo, str):
+        return mo
+
+    # Navigate nested dicts safely
+    output = mo.get("output") if isinstance(mo, dict) else None
+    message = output.get("message") if isinstance(output, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+
+    # content expected to be a list of dicts with "text"
+    if isinstance(content, list) and len(content) > 0:
+        first = content[0]
+        if isinstance(first, dict):
+            return first.get("text")
+
+    # Fallbacks: some variants may have different layout
+    if isinstance(message, dict) and "text" in message:
+        return message.get("text")
+
+    if isinstance(output, dict) and "text" in output:
+        return output.get("text")
+
+    # Nothing matched
+    return None
+
+with open(file_path, 'r', encoding='utf-8') as f:
+    for idx, line in enumerate(f, start=1):
+        line = line.strip()
+        if not line:
+            errors.append({
+                "Respondent_ID": None,
+                "Model_Output": None,
+                "line_number": idx,
+                "error": "Empty line"
+            })
+            continue
+
+        try:
+            entry = json.loads(line)
+
+            # Try multiple keys for respondent id, just in case schema varies
+            respondent_id = (
+                entry.get("recordId")
+                or entry.get("Respondent_ID")
+                or entry.get("respondent_id")
+            )
+
+            model_output = safe_get_model_text(entry)
+
+            if respondent_id is not None and model_output is not None:
+                records.append({
+                    "Respondent_ID": respondent_id,
+                    "Model_Output": model_output
+                })
+            else:
+                errors.append({
+                    "Respondent_ID": respondent_id,
+                    "Model_Output": model_output,
+                    "line_number": idx,
+                    "error": "Missing respondent_id or model_output"
+                })
+
+        except json.JSONDecodeError as e:
+            errors.append({
+                "Respondent_ID": None,
+                "Model_Output": None,
+                "line_number": idx,
+                "error": f"JSON decode error: {str(e)}",
+                "raw_line": line[:500]  # capture a snippet for debugging
+            })
+        except Exception as e:
+            errors.append({
+                "Respondent_ID": None,
+                "Model_Output": None,
+                "line_number": idx,
+                "error": f"Unexpected error: {str(e)}"
+            })
+
+extract_df = pd.DataFrame(records)
+error_df = pd.DataFrame(errors)
+
+df = extract_df.copy()
+
+expanded_rows = []
+error_rows = []
+
+for idx, row in df.iterrows():
+    respondent_id = row[0]  # First column
+    json_str = row[1]       # Second column
+    
+    try:
+        # Step 2: Parse JSON string
+        data_dict = json.loads(json_str)
+        
+        # Step 3: Expand into multiple rows
+        for category_id, sentiment in data_dict.items():
+            expanded_rows.append({
+                "Respondent_ID": respondent_id,
+                "Category_ID": int(category_id),
+                "Sentiment": sentiment
+            })
+    except Exception as e:
+        # Capture error rows
+        error_rows.append({
+            "Respondent_ID": respondent_id,
+            "Raw_Data": json_str,
+            "Error": str(e)
+        })
+
+final_df = pd.DataFrame(expanded_rows)
+error_df = pd.DataFrame(error_rows)
+
+final_df.to_excel("Final_Categorization_Sentiments.xlsx", index=False)
+
+
+
+
+
